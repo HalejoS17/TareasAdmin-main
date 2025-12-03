@@ -30,6 +30,8 @@ spec:
               value: "sqlite"
             - name: DB_DATABASE
               value: "/var/www/html/database/database.sqlite"
+            - name: LAUNCHDARKLY_SDK_KEY
+              value: "sdk-c927fc07-278d-4219-8529-4f8d4ebfcb3a"
           volumeMounts:
             - name: sqlite-volume
               mountPath: /var/www/html/database
