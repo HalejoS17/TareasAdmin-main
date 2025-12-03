@@ -1,7 +1,34 @@
 <?php
 
+use App\Http\Controllers\TareaController;
 use App\Http\Controllers\ProfileController;
 use Illuminate\Support\Facades\Route;
+use LaunchDarkly\LDClient;
+use LaunchDarkly\LDContext;
+
+Route::get('/feature-test', function () {
+
+    $sdkKey = config('services.launchdarkly.sdk_key');
+
+    if (!$sdkKey) {
+        return "❌ ERROR: SDK key es NULL. Revisa config/services.php";
+    }
+
+    $client = new LDClient($sdkKey);
+
+    // Crear el contexto correctamente
+    $context = LDContext::builder('usuario-demo')
+        ->kind('user')
+        ->build();
+
+    // Evaluar el flag
+    $flag = $client->variation("nuevo_dashboard", $context, false);
+
+    return $flag
+        ? "🚀 Feature flag ACTIVADO: Nuevo Dashboard habilitado"
+        : "⛔ Feature flag DESACTIVADO: Mostrando versión antigua";
+});
+
 
 Route::get('/', function () {
     return view('welcome');
@@ -16,8 +43,6 @@ Route::middleware('auth')->group(function () {
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
     Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
 });
-
-use App\Http\Controllers\TareaController;
 
 Route::middleware(['auth'])->group(function () {
     Route::resource('tareas', TareaController::class);
