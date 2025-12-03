@@ -1,0 +1,330 @@
+version: 2.1
+
+executors:
+  php82_node:
+    docker:
+      - image: cimg/php:8.2-node
+    resource_class: medium
+
+commands:
+  install_composer_cached:
+    steps:
+      - restore_cache:
+          keys:
+            - composer-v1-{{ checksum "composer.lock" }}
+            - composer-v1-
+      - run:
+          name: Instalar dependencias Composer
+          command: composer install --no-interaction --prefer-dist --no-progress
+      - save_cache:
+          key: composer-v1-{{ checksum "composer.lock" }}
+          paths:
+            - vendor
+
+  install_node_cached:
+    steps:
+      - restore_cache:
+          keys:
+            - node-v1-{{ checksum "package-lock.json" }}
+            - node-v1-
+      - run:
+          name: Instalar dependencias Node
+          command: |
+            if [ -f package.json ]; then
+              npm ci
+            fi
+      - save_cache:
+          key: node-v1-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+
+jobs:
+  build:
+    executor: php82_node
+    steps:
+      - checkout
+      - install_composer_cached
+      - install_node_cached
+      - run:
+          name: Compilar assets (Vite)
+          command: |
+            if [ -f package.json ]; then
+              npm run build
+            else
+              mkdir -p public/build && echo '{}' > public/build/manifest.json
+            fi
+
+  lint:
+    executor: php82_node
+    steps:
+      - checkout
+      - install_composer_cached
+      - run:
+          name: Analizar código con Laravel Pint (falla si hay issues)
+          command: |
+            if [ -f vendor/bin/pint ]; then
+              vendor/bin/pint -v --test
+            else
+              echo "Laravel Pint no está instalado" && exit 1
+            fi
+
+  run-tests:
+    executor: php82_node
+    steps:
+      - checkout
+      - install_composer_cached
+      - run:
+          name: Preparar entorno de pruebas (SQLite memoria)
+          command: |
+            cp .env.example .env
+            php artisan key:generate
+            echo "DB_CONNECTION=sqlite" >> .env
+            echo "DB_DATABASE=:memory:" >> .env
+            php artisan config:clear
+      - run:
+          name: Ejecutar pruebas (todas las suites)
+          command: php artisan test --colors=always
+
+  integration-tests:
+    executor: php82_node
+    steps:
+      - checkout
+      - install_composer_cached
+      - run:
+          name: Preparar entorno de pruebas (SQLite memoria)
+          command: |
+            cp .env.example .env
+            php artisan key:generate
+            echo "DB_CONNECTION=sqlite" >> .env
+            echo "DB_DATABASE=:memory:" >> .env
+            php artisan config:clear
+      - run:
+          name: Ejecutar solo suite Feature
+          command: php artisan test --testsuite=Feature --colors=always
+
+  code-coverage:
+    executor: php82_node
+    steps:
+      - checkout
+      - install_composer_cached
+      - run:
+          name: Instalar y habilitar Xdebug para cobertura
+          command: |
+            sudo pecl install xdebug
+            echo "zend_extension=$(php -r 'echo ini_get(\"extension_dir\");')/xdebug.so" | sudo tee /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+            echo "xdebug.mode=coverage" | sudo tee -a /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+            echo "xdebug.start_with_request=yes" | sudo tee -a /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+            php -m | grep xdebug || (echo '❌ Xdebug no se cargó correctamente' && exit 1)
+      - run:
+          name: Configurar variable de entorno XDEBUG_MODE
+          command: |
+            export XDEBUG_MODE=coverage
+            php -v
+            php -m | grep xdebug
+      - run:
+          name: Preparar entorno de pruebas (SQLite memoria)
+          command: |
+            cp .env.example .env
+            php artisan key:generate
+            echo "DB_CONNECTION=sqlite" >> .env
+            echo "DB_DATABASE=:memory:" >> .env
+            php artisan config:clear
+      - run:
+          name: Ejecutar PHPUnit con cobertura
+          command: |
+            export XDEBUG_MODE=coverage
+            vendor/bin/phpunit --coverage-text --colors=never | tee coverage-summary.txt
+      - store_artifacts:
+          path: coverage-summary.txt
+          destination: code-coverage
+
+  security-audit:
+    executor: php82_node
+    steps:
+      - checkout
+      - install_composer_cached
+      - install_node_cached
+      - run:
+          name: Auditoría Composer (vulnerabilidades)
+          command: |
+            # composer audit falla con vulnerabilidades conocidas → eso es lo deseado
+            composer audit || (echo "Composer audit encontró vulnerabilidades" && exit 1)
+      - run:
+          name: Auditoría NPM (nivel high+)
+          command: |
+            if [ -f package.json ]; then
+              npm audit --audit-level=high || (echo "NPM audit encontró vulnerabilidades high/critical" && exit 1)
+            fi
+
+  notify-email:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Enviar resumen detallado del pipeline por correo
+          command: |
+            set -euo pipefail
+
+            sudo apt-get update -y && sudo apt-get install -y msmtp-mta jq git curl
+
+            {
+              echo 'defaults'
+              echo 'auth on'
+              echo 'tls on'
+              echo 'tls_trust_file /etc/ssl/certs/ca-certificates.crt'
+              echo 'account gmail'
+              echo 'host smtp.gmail.com'
+              echo 'port 587'
+              echo "from ${SMTP_USER}"
+              echo "user ${SMTP_USER}"
+              echo "password ${SMTP_PASS}"
+              echo 'account default : gmail'
+            } > ~/.msmtprc
+            chmod 600 ~/.msmtprc
+
+            WF_JSON=$(curl -s -H "Circle-Token: $CIRCLE_API_TOKEN" "https://circleci.com/api/v2/pipeline/${CIRCLE_PIPELINE_ID}/workflow")
+            WORKFLOW_ID=$(echo "$WF_JSON" | jq -r '.items[0].id')
+
+            echo 'Esperando a que terminen los demás jobs...'
+            for i in $(seq 1 90); do
+              JOBS_JSON=$(curl -s -H "Circle-Token: $CIRCLE_API_TOKEN" "https://circleci.com/api/v2/workflow/${WORKFLOW_ID}/job")
+              PENDIENTES=$(echo "$JOBS_JSON" \
+                | jq -r '.items[] | select(.name != "notify-email") | select(.status=="running" or .status=="on_hold" or .status=="queued")' \
+                | wc -l)
+              [ "$PENDIENTES" -eq 0 ] && break
+              sleep 5
+            done || true
+
+            JOBS_INFO=$(echo "$JOBS_JSON" | jq -r '.items[] | "\(.name): \(.status)"')
+            TOTAL_JOBS=$(echo "$JOBS_INFO" | grep -v "notify-email" | wc -l | tr -d ' ')
+            SUCCESS_COUNT=$(echo "$JOBS_INFO" | grep -v "notify-email" | grep -c "success" || true)
+            FAILED_COUNT=$(echo "$JOBS_INFO" | grep -v "notify-email" | grep -c "failed" || true)
+            RUNNING_COUNT=$(echo "$JOBS_INFO" | grep -c "running" || true)
+            RUNNING_NAMES=$(echo "$JOBS_INFO" | grep "running" | awk -F':' '{print $1}' | tr '\n' ',' | sed 's/,$//' )
+
+            if [ "$TOTAL_JOBS" -gt 0 ]; then
+              SUCCESS_PERCENT=$(( 100 * SUCCESS_COUNT / TOTAL_JOBS ))
+            else
+              SUCCESS_PERCENT=0
+            fi
+
+            if [ "$FAILED_COUNT" -eq 0 ]; then
+              RESULTADO='✅ <b>Todos los jobs se completaron correctamente.</b>'
+              COLOR="#4CAF50"
+            else
+              RESULTADO='⚠️ <b>Se detectaron fallos en uno o más jobs.</b>'
+              COLOR="#E53935"
+            fi
+
+            PIPELINE_TIME=$(date "+%d/%m/%Y %H:%M:%S")
+            AUTHOR=$(git log -1 --pretty=format:'%an')
+            MESSAGE=$(git log -1 --pretty=format:'%s')
+            HASH=$(git rev-parse --short HEAD)
+
+            {
+              echo "To: ${SMTP_USER}"
+              echo "Subject: 🧩 Pipeline de ${CIRCLE_PROJECT_REPONAME} – Estado general"
+              echo "Content-Type: text/html"
+              echo
+              echo "<html><body style='font-family:Segoe UI, Arial, sans-serif; background-color:#f5f6f7; color:#333;'>
+              <div style='max-width:650px; margin:auto; background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.15); padding:24px;'>
+                <h2 style='color:${COLOR}; text-align:center;'>🚀 Pipeline – ${CIRCLE_PROJECT_REPONAME}</h2>
+                <hr style='border:none; border-top:2px solid #eee; margin:16px 0;'>
+                
+                <p style='font-size:15px;'>
+                  <b>📦 Proyecto:</b> ${CIRCLE_PROJECT_REPONAME}<br>
+                  <b>🌿 Rama:</b> ${CIRCLE_BRANCH}<br>
+                  <b>🕓 Fecha:</b> ${PIPELINE_TIME}<br>
+                  <b>👤 Commit:</b> ${AUTHOR} – ${MESSAGE} <code>(${HASH})</code>
+                </p>
+
+                <div style='background:#fafafa; border-radius:10px; padding:20px; margin:20px 0; border:1px solid #e0e0e0;'>
+                  <h3 style='margin-top:0; color:#333;'>📋 Estado de los Jobs</h3>
+
+                  <table style='width:100%; border-collapse:collapse; font-size:14px;'>
+                    <thead>
+                      <tr style='background-color:#f1f1f1; text-align:left;'>
+                        <th style='padding:8px;'>Job</th>
+                        <th style='padding:8px;'>Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      $(echo "${JOBS_INFO}" | while read line; do
+                        job=$(echo $line | awk -F':' '{print $1}')
+                        status=$(echo $line | awk -F':' '{print $2}' | xargs)
+                        if [ "$status" = "success" ]; then
+                          echo "<tr><td style='padding:8px;'>✅ <b>$job</b></td><td style='padding:8px; color:#4CAF50;'>Completado con éxito</td></tr>"
+                        elif [ "$status" = "failed" ]; then
+                          echo "<tr><td style='padding:8px;'>❌ <b>$job</b></td><td style='padding:8px; color:#E53935;'>Error detectado</td></tr>"
+                        elif [ "$status" = "running" ]; then
+                          echo "<tr><td style='padding:8px;'>⚙️ <b>$job</b></td><td style='padding:8px; color:#FF9800;'>En ejecución</td></tr>"
+                        else
+                          echo "<tr><td style='padding:8px;'>⏳ <b>$job</b></td><td style='padding:8px; color:#9E9E9E;'>Pendiente</td></tr>"
+                        fi
+                      done)
+                    </tbody>
+                  </table>
+
+                  <div style='margin-top:16px;'>
+                    <p style='font-size:14px; margin-bottom:8px;'><b>📈 Tasa de éxito general:</b> ${SUCCESS_PERCENT}%</p>
+                    <div style='width:100%; height:14px; background:#e0e0e0; border-radius:7px; overflow:hidden;'>
+                      <div style='width:${SUCCESS_PERCENT}%; height:14px; background:${COLOR}; transition:width 0.5s ease;'></div>
+                    </div>
+                  </div>
+
+                  <p style='margin-top:12px; font-size:13px; color:#555;'>
+                    ✅ Éxitos: <b>${SUCCESS_COUNT}</b> / ${TOTAL_JOBS} &nbsp; | &nbsp;
+                    ❌ Fallos: <b>${FAILED_COUNT}</b> &nbsp; | &nbsp;
+                    🚧 En ejecución: <b>${RUNNING_COUNT}</b>
+                  </p>
+                </div>
+                <div style='background:#fffbe6; border-left:4px solid ${COLOR}; padding:12px 16px; border-radius:6px;'>
+                  ${RESULTADO}
+                </div>
+
+                <div style='text-align:center; margin-top:20px;'>
+                  <a href='https://app.circleci.com/pipelines/workflows/${WORKFLOW_ID}'
+                    style='display:inline-block; background:${COLOR}; color:white; padding:10px 20px; border-radius:8px; text-decoration:none; font-weight:bold;'>
+                    Ver detalles en CircleCI
+                  </a>
+                </div>
+
+                <hr style='border:none; border-top:2px solid #eee; margin:24px 0;'>
+                <p style='font-size:12px; color:#666; text-align:center;'>
+                  🧠 CircleCI Notifier<br>
+                  <i>Este mensaje se generó automáticamente.</i>
+                </p>
+              </div>
+              </body></html>"
+            } > email.txt
+
+            cat email.txt | msmtp --from=${SMTP_USER} -t
+
+workflows:
+  ci_workflow:
+    jobs:
+      - build
+      - lint
+      - run-tests
+      - integration-tests
+      - code-coverage
+      - security-audit
+      - notify-email:
+          filters:
+            branches:
+              only: main
+
+  nightly_workflow:
+    triggers:
+      - schedule:
+          cron: "0 0 * * *" 
+          filters:
+            branches:
+              only:
+                - main
+    jobs:
+      - security-audit
+      - run-tests
+      - code-coverage
+
