@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tareasadmin-deployment
+  namespace: tareasadmin
+  labels:
+    app: tareasadmin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tareasadmin
+  template:
+    metadata:
+      labels:
+        app: tareasadmin
+    spec:
+      containers:
+        - name: tareasadmin
+          image: sha1727/tareasadmin:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000   # ✔ CORRECTO según tu Dockerfile
+          env:
+            - name: APP_ENV
+              value: "production"
+            - name: APP_DEBUG
+              value: "false"
+            - name: DB_CONNECTION
+              value: "sqlite"
+            - name: DB_DATABASE
+              value: "/var/www/html/database/database.sqlite"
+          volumeMounts:
+            - name: sqlite-volume
+              mountPath: /var/www/html/database
+      volumes:
+        - name: sqlite-volume
+          emptyDir: {}
